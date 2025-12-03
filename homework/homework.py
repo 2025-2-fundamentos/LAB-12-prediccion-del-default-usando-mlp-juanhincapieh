@@ -96,3 +96,157 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import gzip
+import json
+import os
+import pickle
+from pathlib import Path
+
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from sklearn.model_selection import GridSearchCV
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+
+def loadDataset(filePath: str) -> pd.DataFrame:
+    return pd.read_csv(filePath, compression="zip").copy()
+
+
+def cleanDataframe(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.rename(columns={"default payment next month": "default"})
+    if "ID" in df.columns:
+        df = df.drop(columns=["ID"])
+    df = df[(df["MARRIAGE"] != 0) & (df["EDUCATION"] != 0)]
+    df.loc[df["EDUCATION"] >= 4, "EDUCATION"] = 4
+    df = df.dropna()
+    return df
+
+
+def splitFeaturesTarget(df: pd.DataFrame):
+    x = df.drop(columns=["default"])
+    y = df["default"]
+    return x, y
+
+
+def buildPipeline(categoricalFeatures, numericFeatures) -> Pipeline:
+    transformers = [
+        ("categorical", OneHotEncoder(), categoricalFeatures),
+        ("numeric", StandardScaler(), numericFeatures),
+    ]
+    preprocessor = ColumnTransformer(transformers=transformers)
+
+    selector = SelectKBest(score_func=f_classif)
+    pca = PCA()
+    classifier = MLPClassifier(max_iter=15000, random_state=21)
+
+    pipe = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            ("selector", selector),
+            ("pca", pca),
+            ("mlp", classifier),
+        ]
+    )
+    return pipe
+
+
+def getSearchModel(pipe: Pipeline) -> GridSearchCV:
+    paramGrid = {
+        "selector__k": [20],
+        "pca__n_components": [None],
+        "mlp__hidden_layer_sizes": [(50, 30, 40, 60)],
+        "mlp__alpha": [0.26],
+        "mlp__learning_rate_init": [0.001],
+    }
+
+    search = GridSearchCV(
+        estimator=pipe,
+        param_grid=paramGrid,
+        cv=10,
+        scoring="balanced_accuracy",
+        n_jobs=-1,
+        refit=True,
+    )
+    return search
+
+
+def saveModel(model, modelPath: str):
+    os.makedirs(os.path.dirname(modelPath), exist_ok=True)
+    with gzip.open(modelPath, "wb") as f:
+        pickle.dump(model, f)
+
+
+def getMetricsDict(yTrue, yPred, datasetName: str) -> dict:
+    return {
+        "type": "metrics",
+        "dataset": datasetName,
+        "precision": precision_score(yTrue, yPred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(yTrue, yPred),
+        "recall": recall_score(yTrue, yPred, zero_division=0),
+        "f1_score": f1_score(yTrue, yPred, zero_division=0),
+    }
+
+
+def getConfusionDict(yTrue, yPred, datasetName: str) -> dict:
+    tn, fp, fn, tp = confusion_matrix(yTrue, yPred).ravel()
+    return {
+        "type": "cm_matrix",
+        "dataset": datasetName,
+        "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+        "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)},
+    }
+
+
+def writeMetricsFile(records, outputPath: str):
+    Path(os.path.dirname(outputPath)).mkdir(parents=True, exist_ok=True)
+    with open(outputPath, "w", encoding="utf-8") as f:
+        for row in records:
+            f.write(json.dumps(row) + "\n")
+
+
+def run():
+    trainDf = loadDataset("files/input/train_data.csv.zip")
+    testDf = loadDataset("files/input/test_data.csv.zip")
+
+    trainDf = cleanDataframe(trainDf)
+    testDf = cleanDataframe(testDf)
+
+    xTrain, yTrain = splitFeaturesTarget(trainDf)
+    xTest, yTest = splitFeaturesTarget(testDf)
+
+    categoricalCols = ["SEX", "EDUCATION", "MARRIAGE"]
+    numericCols = [col for col in xTrain.columns if col not in categoricalCols]
+
+    pipeline = buildPipeline(categoricalCols, numericCols)
+    searchModel = getSearchModel(pipeline)
+    searchModel.fit(xTrain, yTrain)
+
+    saveModel(searchModel, "files/models/model.pkl.gz")
+
+    yTrainPred = searchModel.predict(xTrain)
+    yTestPred = searchModel.predict(xTest)
+
+    trainMetrics = getMetricsDict(yTrain, yTrainPred, "train")
+    testMetrics = getMetricsDict(yTest, yTestPred, "test")
+
+    trainCm = getConfusionDict(yTrain, yTrainPred, "train")
+    testCm = getConfusionDict(yTest, yTestPred, "test")
+
+    records = [trainMetrics, testMetrics, trainCm, testCm]
+    writeMetricsFile(records, "files/output/metrics.json")
+
+
+if __name__ == "__main__":
+    run()
